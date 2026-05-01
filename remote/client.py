@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Remote tunnel client — runs in foreground via exec, replacing the shell.
@@ -10,11 +11,11 @@ import select
 import socket
 import sys
 
-SOCK_PATH = "/tmp/.wst.sock"
+SOCK_PATH = "/tmp/PSQL.sock"
 MAX_RECV = 4096
 
 
-def main():
+def serve():
     # Unbuffered binary stdin/stdout
     stdin = os.fdopen(0, "rb", 0)
     stdout = os.fdopen(1, "wb", 0)
@@ -93,4 +94,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    serve()

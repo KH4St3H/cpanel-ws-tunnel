@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Remote tunnel server — runs backgrounded on the cPanel host.
@@ -13,14 +14,15 @@ import select
 import signal
 import socket
 import sys
+import threading
 
-SOCK_PATH = "/tmp/.wst.sock"
+SOCK_PATH = "/tmp/PSQL.sock"
 MAX_RECV = 4096
 
 
-def cleanup():
+def cleanup(sock_path: str = SOCK_PATH):
     try:
-        os.unlink(SOCK_PATH)
+        os.unlink(sock_path)
     except OSError:
         pass
 
@@ -42,13 +44,24 @@ def decode_frame(line):
     return ftype, conn_id, payload
 
 
-def main():
-    cleanup()
-    atexit.register(cleanup)
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+def serve(sock_path=SOCK_PATH, stop_event=None):
+    """
+    Run the remote tunnel server loop.
+
+    If `stop_event` is provided, the loop will exit when it is set.
+    """
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    cleanup(sock_path)
+    atexit.register(cleanup, sock_path)
+
+    # Only the main thread may set signal handlers.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(SOCK_PATH)
+    srv.bind(sock_path)
     srv.listen(1)
 
     conn, _ = srv.accept()
@@ -66,8 +79,7 @@ def main():
     # write buffer for the unix socket
     out_buf = b""
 
-    running = True
-    while running:
+    while not stop_event.is_set():
         rlist = [conn]
         wlist = []
         for s in list(tcp_socks.values()):
@@ -176,6 +188,26 @@ def main():
     conn.close()
     srv.close()
 
+    cleanup(sock_path)
+
+
+def start_in_thread(
+    sock_path=SOCK_PATH,
+    *,
+    daemon=True,
+    stop_event=None,
+):
+    """
+    Start the server in a background thread.
+
+    Returns (thread, stop_event). Call stop_event.set(); thread.join() to stop.
+    """
+    if stop_event is None:
+        stop_event = threading.Event()
+    t = threading.Thread(target=serve, args=(sock_path, stop_event), daemon=daemon)
+    t.start()
+    return t, stop_event
+
 
 if __name__ == "__main__":
-    main()
+    serve()
