@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-HTTP tunnel client — authenticates with cPanel, deploys remote scripts via
-the WebSocket terminal, then runs a local TCP forwarder. Every connection
-to the local listener is tunnelled to 185.185.185.185:80 on the cPanel
-host, where an HTTP server routes by Host header. Plain HTTP and VLESS
-xhttp transport both ride this raw byte pipe unchanged.
+HTTP tunnel client — bash-on-remote variant.
+
+Each local TCP connection opens its own cPanel WebSocket terminal. Inside
+that session we put the PTY in raw mode and exec a bash one-liner that
+opens /dev/tcp/185.185.185.185/80 on fd 3 and runs two cats — one for
+each direction — between stdin/stdout and that fd. The local Python side
+is then just a byte pump between the local TCP socket and the WebSocket;
+no remote Python, no N/D/C framing.
 """
 
 import asyncio
@@ -13,72 +16,128 @@ import sys
 
 import requests
 import websockets
+from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from cpanel_auth import CONFIG_FILE, load_config, cpanel_login, build_ws_url
-from tunnel_client import WsMux, deploy_remote, get_conn_id
 
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 8080
-REMOTE_TARGET = "185.185.185.185:80"
-MAX_CHUNK = 2048
+REMOTE_HOST = "185.185.185.185"
+REMOTE_PORT = 80
+MAX_CHUNK = 4096
+READY_MARKER = b"TUNNEL_READY"
 
 
-async def handle_client(reader, writer, mux):
-    conn_id = None
+async def _drain(ws, timeout=0.3):
     try:
-        conn_id = await get_conn_id()
-        q = mux.register(conn_id)
+        while True:
+            await asyncio.wait_for(ws.recv(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
 
-        await mux.send_frame("N", conn_id, REMOTE_TARGET.encode("utf-8"))
-        ftype, payload = await asyncio.wait_for(q.get(), timeout=15.0)
-        if ftype != "A" or not payload.startswith(b"OK"):
-            return
 
-        async def local_to_remote():
+async def setup_passthrough(ws):
+    """Put PTY in raw mode, then exec the bash byte pump.
+    Returns any bytes received after the TUNNEL_READY marker."""
+    await ws.send("stty raw -echo\n")
+    await asyncio.sleep(0.3)
+    await ws.send("export PS1=''\n")
+    await asyncio.sleep(0.2)
+    await _drain(ws, 0.4)
+
+    cmd = (
+        "exec 3<>/dev/tcp/%s/%d; "
+        "echo %s; "
+        "cat <&3 & exec cat >&3\n"
+    ) % (REMOTE_HOST, REMOTE_PORT, READY_MARKER.decode())
+    await ws.send(cmd)
+
+    buf = b""
+    while READY_MARKER not in buf:
+        try:
+            frame = await asyncio.wait_for(ws.recv(), timeout=15.0)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Timed out waiting for TUNNEL_READY")
+        if isinstance(frame, str):
+            frame = frame.encode("utf-8", errors="replace")
+        buf += frame
+
+    after = buf.split(READY_MARKER, 1)[1].lstrip(b"\r\n")
+    return after
+
+
+async def pipe_ws_to_local(ws, writer, initial=b""):
+    try:
+        if initial:
+            writer.write(initial)
+            await writer.drain()
+        async for frame in ws:
+            if isinstance(frame, str):
+                frame = frame.encode("utf-8", errors="replace")
+            writer.write(frame)
+            await writer.drain()
+    except (ConnectionClosedOK, ConnectionClosedError, ConnectionError, OSError):
+        pass
+
+
+async def pipe_local_to_ws(reader, ws):
+    try:
+        while True:
+            data = await reader.read(MAX_CHUNK)
+            if not data:
+                return
+            await ws.send(data)
+    except (ConnectionError, OSError, ConnectionClosedError, ConnectionClosedOK):
+        pass
+
+
+async def handle_client(reader, writer, cfg, ssl_ctx):
+    ws = None
+    try:
+        token, cookie = cpanel_login(
+            cfg["host"], cfg["port"], cfg["username"], cfg["password"],
+            cfg["verify_ssl"],
+        )
+        ws_url = build_ws_url(cfg["host"], cfg["port"], token)
+        origin = "https://%s:%d" % (cfg["host"], cfg["port"])
+
+        ws = await websockets.connect(
+            ws_url,
+            ssl=ssl_ctx,
+            additional_headers={"Origin": origin, "Cookie": cookie},
+            ping_interval=20,
+            ping_timeout=30,
+            max_size=None,
+        )
+
+        initial = await setup_passthrough(ws)
+
+        l2w = asyncio.ensure_future(pipe_local_to_ws(reader, ws))
+        w2l = asyncio.ensure_future(pipe_ws_to_local(ws, writer, initial))
+        done, pending = await asyncio.wait(
+            {l2w, w2l}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        for t in pending:
             try:
-                while True:
-                    data = await reader.read(MAX_CHUNK)
-                    if not data:
-                        await mux.send_frame("C", conn_id)
-                        return
-                    for i in range(0, len(data), MAX_CHUNK):
-                        await mux.send_frame("D", conn_id, data[i:i + MAX_CHUNK])
-            except (ConnectionError, OSError):
-                await mux.send_frame("C", conn_id)
-
-        async def remote_to_local():
-            try:
-                while True:
-                    ftype, payload = await q.get()
-                    if ftype == "D":
-                        writer.write(payload)
-                        await writer.drain()
-                    elif ftype == "C" or ftype is None:
-                        return
-            except (ConnectionError, OSError):
+                await t
+            except asyncio.CancelledError:
                 pass
 
-        await asyncio.gather(local_to_remote(), remote_to_local())
-
-    except (asyncio.TimeoutError, ConnectionError,
-            asyncio.IncompleteReadError, OSError) as e:
+    except (RuntimeError, OSError, ConnectionError,
+            ConnectionClosedError, ConnectionClosedOK) as e:
         print("[-] forward error: %s" % e)
     finally:
-        if conn_id is not None:
-            mux.unregister(conn_id)
+        if ws is not None:
+            try:
+                await ws.close()
+            except OSError:
+                pass
         try:
             writer.close()
         except OSError:
             pass
-
-
-async def keepalive(mux):
-    try:
-        while True:
-            await asyncio.sleep(15)
-            await mux.send_frame("P", 0)
-    except asyncio.CancelledError:
-        pass
 
 
 async def run_tunnel(cfg):
@@ -90,48 +149,22 @@ async def run_tunnel(cfg):
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
 
-    print("[*] Logging in to cPanel ...")
-    token, cookie = cpanel_login(
-        cfg["host"], cfg["port"], cfg["username"], cfg["password"], verify_ssl
+    bind_host = cfg.get("listen_host", LISTEN_HOST)
+    bind_port = cfg.get("listen_port", LISTEN_PORT)
+
+    server = await asyncio.start_server(
+        lambda r, w: handle_client(r, w, cfg, ssl_ctx),
+        bind_host, bind_port,
     )
-    print("[+] Authenticated. Token: cpsess%s..." % token[:8])
+    print("[+] Forwarding %s:%d -> WS(bash bridge) -> %s:%d"
+          % (bind_host, bind_port, REMOTE_HOST, REMOTE_PORT))
 
-    ws_url = build_ws_url(cfg["host"], cfg["port"], token)
-    origin = "https://%s:%d" % (cfg["host"], cfg["port"])
-
-    print("[*] Connecting WebSocket ...")
-    async with websockets.connect(
-        ws_url,
-        ssl=ssl_ctx,
-        additional_headers={"Origin": origin, "Cookie": cookie},
-        ping_interval=20,
-        ping_timeout=30,
-    ) as ws:
-        print("[*] Deploying remote scripts ...")
-        await deploy_remote(ws)
-
-        mux = WsMux(ws)
-        await mux.start()
-        ka_task = asyncio.ensure_future(keepalive(mux))
-
-        bind_host = cfg.get("listen_host", LISTEN_HOST)
-        bind_port = cfg.get("listen_port", LISTEN_PORT)
-        server = await asyncio.start_server(
-            lambda r, w: handle_client(r, w, mux),
-            bind_host, bind_port,
-        )
-        print("[+] Forwarding %s:%d -> tunnel -> %s"
-              % (bind_host, bind_port, REMOTE_TARGET))
-
-        try:
-            await server.serve_forever()
-        except asyncio.CancelledError:
-            pass
-        finally:
-            ka_task.cancel()
-            await mux.stop()
-            server.close()
-            print("[*] Tunnel closed.")
+    try:
+        await server.serve_forever()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        server.close()
 
 
 def main():
@@ -161,9 +194,6 @@ def main():
         sys.exit(1)
     except requests.exceptions.ConnectionError as e:
         print("Connection error: %s" % e, file=sys.stderr)
-        sys.exit(1)
-    except RuntimeError as e:
-        print("Error: %s" % e, file=sys.stderr)
         sys.exit(1)
 
 
