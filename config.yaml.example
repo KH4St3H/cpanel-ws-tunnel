@@ -1,0 +1,7 @@
+cpanel:
+  host: "your.cpanel.host"
+  port: 2083
+  username: your_username
+  password: "your_password"
+  verify_ssl: false
+  proxy: "socks5://127.0.0.1:20001"

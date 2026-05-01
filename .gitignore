@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+.session_cache.json
+config.yaml
+config.yaml.bak
