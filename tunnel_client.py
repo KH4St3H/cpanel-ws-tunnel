@@ -73,7 +73,7 @@ async def deploy_remote(ws):
     await drain(0.5)
 
     # Read and base64-encode the remote scripts
-    for local_name, remote_path in [("server.py", "/tmp/.ts.py"), ("client.py", "/tmp/.tc.py")]:
+    for local_name, remote_path in [("server.py", "/tmp/.ts.py"), ("client.sh", "/tmp/.tc.sh")]:
         with open(os.path.join(REMOTE_DIR, local_name), "rb") as f:
             b64 = base64.b64encode(f.read()).decode("ascii")
         cmd = (
@@ -91,8 +91,8 @@ async def deploy_remote(ws):
     await asyncio.sleep(1.0)
     await drain(0.3)
 
-    # Replace the shell with the client script
-    await send_cmd("exec python3 /tmp/.tc.py")
+    # Replace the shell with the bash bridge
+    await send_cmd("exec bash /tmp/.tc.sh")
 
     # Wait for TUNNEL_READY
     buf = ""
