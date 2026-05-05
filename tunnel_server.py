@@ -17,7 +17,11 @@ import traceback
 
 import requests
 import websockets
-from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.exceptions import (
+    ConnectionClosed,
+    ConnectionClosedError,
+    ConnectionClosedOK,
+)
 
 from cpanel_auth import CONFIG_FILE, load_config, cpanel_login, build_ws_url
 from proxy_util import create_proxy_connection
@@ -163,24 +167,35 @@ class WsMux:
     async def _reader_loop(self):
         buf = ""
         try:
-            async for raw in self.ws:
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8", errors="replace")
-                buf += raw
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    if not line.strip():
-                        continue
-                    ftype, cid, payload = decode_frame(line)
-                    if ftype is None:
-                        continue
-                    q = self._queues.get(cid)
-                    if q is not None:
-                        await q.put((ftype, payload))
-        except (ConnectionClosedOK, ConnectionClosedError):
-            pass
-        for q in self._queues.values():
-            await q.put((None, b""))
+            try:
+                async for raw in self.ws:
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
+                    buf += raw
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        if not line.strip():
+                            continue
+                        ftype, cid, payload = decode_frame(line)
+                        if ftype is None:
+                            continue
+                        q = self._queues.get(cid)
+                        if q is not None:
+                            await q.put((ftype, payload))
+            except (ConnectionClosedOK, ConnectionClosedError, ConnectionClosed):
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if DEBUG:
+                    traceback.print_exc()
+        finally:
+            # Always unblock SOCKS waiters (avoids hangs if the WS dies oddly).
+            for q in list(self._queues.values()):
+                try:
+                    await q.put((None, b""))
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +352,10 @@ async def _relay_data(reader, writer, mux, q, conn_id):
                         pass
                     break
                 for i in range(0, len(data), MAX_CHUNK):
-                    await mux.send_frame("D", conn_id, data[i:i + MAX_CHUNK])
+                    try:
+                        await mux.send_frame("D", conn_id, data[i:i + MAX_CHUNK])
+                    except ConnectionClosed:
+                        break
         except asyncio.CancelledError:
             raise
         except (ConnectionError, OSError):
@@ -518,7 +536,10 @@ async def handle_udp_associate(reader, writer, mux, conn_id):
         for t in pending:
             t.cancel()
     finally:
-        await mux.send_frame("C", conn_id)
+        try:
+            await mux.send_frame("C", conn_id)
+        except ConnectionClosed:
+            pass
         udp_sock.close()
 
 
@@ -545,6 +566,11 @@ async def handle_socks_client(reader, writer, mux):
         dbg("SOCKS5 error (conn_id=%s): %s" % (conn_id, e))
         if DEBUG:
             traceback.print_exc()
+    except ConnectionClosed as e:
+        print(
+            "[-] SOCKS5: tunnel WebSocket closed (conn_id=%s): %s"
+            % (conn_id, e)
+        )
     except Exception as e:
         print("[-] SOCKS5 unexpected error (conn_id=%s): %s" % (conn_id, e))
         if DEBUG:
@@ -576,8 +602,12 @@ async def keepalive(mux):
 # Main
 # ---------------------------------------------------------------------------
 
-async def run_tunnel_once(cfg, ssl_ctx):
-    """Single tunnel session. Raises on disconnect."""
+async def run_tunnel_once(cfg, ssl_ctx, on_established=None):
+    """Single tunnel session. Raises on disconnect.
+
+    If *on_established* is set, it is called (sync) once the SOCKS proxy is up so
+    the parent can reset reconnect backoff after a healthy bring-up.
+    """
     verify_ssl = cfg["verify_ssl"]
 
     proxy = cfg.get("proxy")
@@ -633,15 +663,46 @@ async def run_tunnel_once(cfg, ssl_ctx):
             "127.0.0.1", SOCKS5_PORT,
         )
         print("[+] SOCKS5 proxy listening on 127.0.0.1:%d" % SOCKS5_PORT)
+        if on_established is not None:
+            on_established()
 
+        serve_task = asyncio.create_task(server.serve_forever())
+        reader_task = mux._reader_task
+        tunnel_ws_dead = False
         try:
-            await server.serve_forever()
+            done, _pending = await asyncio.wait(
+                {serve_task, reader_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            finished = next(iter(done))
+            if finished is reader_task:
+                if not reader_task.cancelled():
+                    tunnel_ws_dead = True
+                    print(
+                        "[!] Tunnel WebSocket reader ended (remote closed or error); "
+                        "will reconnect."
+                    )
+                serve_task.cancel()
+            else:
+                reader_task.cancel()
+            await asyncio.gather(serve_task, reader_task, return_exceptions=True)
         except asyncio.CancelledError:
-            pass
+            serve_task.cancel()
+            reader_task.cancel()
+            await asyncio.gather(serve_task, reader_task, return_exceptions=True)
+            raise
         finally:
             ka_task.cancel()
+            try:
+                await ka_task
+            except asyncio.CancelledError:
+                pass
             await mux.stop()
             server.close()
+            await server.wait_closed()
+
+        if tunnel_ws_dead:
+            raise RuntimeError("WebSocket tunnel closed")
 
 
 async def run_tunnel(cfg):
@@ -653,9 +714,14 @@ async def run_tunnel(cfg):
         ssl_ctx.verify_mode = ssl.CERT_NONE
 
     retry = 0
+
+    def session_established():
+        nonlocal retry
+        retry = 0
+
     while True:
         try:
-            await run_tunnel_once(cfg, ssl_ctx)
+            await run_tunnel_once(cfg, ssl_ctx, on_established=session_established)
             break  # clean exit
         except KeyboardInterrupt:
             raise

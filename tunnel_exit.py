@@ -330,8 +330,12 @@ class ExitNode:
 # Main loop — read frames from WebSocket, dispatch to ExitNode
 # ---------------------------------------------------------------------------
 
-async def run_exit_once(cfg, ssl_ctx):
-    """Single exit node session. Raises on disconnect."""
+async def run_exit_once(cfg, ssl_ctx, on_established=None):
+    """Single exit node session. Raises on disconnect.
+
+    If *on_established* is set, it is called (sync) once the exit node is active
+    so the parent can reset reconnect backoff after a healthy bring-up.
+    """
     verify_ssl = cfg["verify_ssl"]
 
     proxy = cfg.get("proxy")
@@ -374,6 +378,8 @@ async def run_exit_once(cfg, ssl_ctx):
         ka_task = asyncio.ensure_future(keepalive())
 
         print("[+] Exit node active. Waiting for connections ...")
+        if on_established is not None:
+            on_established()
 
         buf = ""
         try:
@@ -418,9 +424,14 @@ async def run_exit(cfg):
         ssl_ctx.verify_mode = ssl.CERT_NONE
 
     retry = 0
+
+    def session_established():
+        nonlocal retry
+        retry = 0
+
     while True:
         try:
-            await run_exit_once(cfg, ssl_ctx)
+            await run_exit_once(cfg, ssl_ctx, on_established=session_established)
             break
         except KeyboardInterrupt:
             raise
