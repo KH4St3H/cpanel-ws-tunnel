@@ -93,10 +93,12 @@ async def deploy_remote(ws):
     await asyncio.sleep(0.2)
     await drain(0.5)
 
-    # Set up hidden working dir and FIFOs with innocuous names
+    # Set up hidden working dir and FIFOs with innocuous names.
+    # mkfifo is idempotent here (silently no-op if peer already created them)
+    # so either side can come up first without orphaning the other's open fds.
     await send_cmd("mkdir -p $HOME/.cache/.fontconfig")
     await asyncio.sleep(0.2)
-    await send_cmd("rm -f $HOME/.cache/.fontconfig/.uuid-r $HOME/.cache/.fontconfig/.uuid-w; mkfifo $HOME/.cache/.fontconfig/.uuid-r $HOME/.cache/.fontconfig/.uuid-w")
+    await send_cmd("mkfifo $HOME/.cache/.fontconfig/.uuid-r 2>/dev/null; mkfifo $HOME/.cache/.fontconfig/.uuid-w 2>/dev/null; true")
     await asyncio.sleep(0.3)
     await drain(0.3, silent=False)
 

@@ -85,9 +85,13 @@ async def deploy_bridge(ws):
     await asyncio.sleep(0.2)
     await drain(0.5)
 
-    # Wait for Client A to create the FIFOs
-    await send_cmd("while [ ! -p $HOME/.cache/.fontconfig/.uuid-w ]; do sleep 0.2; done")
-    await asyncio.sleep(0.5)
+    # Ensure FIFOs exist. We create them ourselves rather than waiting for
+    # Client A so that the exit node can come up before the server side; the
+    # mkfifo is idempotent (silenced if Client A already created them).
+    await send_cmd("mkdir -p $HOME/.cache/.fontconfig")
+    await asyncio.sleep(0.2)
+    await send_cmd("mkfifo $HOME/.cache/.fontconfig/.uuid-r 2>/dev/null; mkfifo $HOME/.cache/.fontconfig/.uuid-w 2>/dev/null; true")
+    await asyncio.sleep(0.3)
     await drain(0.3, silent=False)
 
     # Open pipes with disguised process names
