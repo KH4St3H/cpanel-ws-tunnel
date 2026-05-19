@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-Tunnel Server (Client A) — SOCKS5 proxy side.
-Connects to cPanel, deploys the relay + bridge scripts,
-starts SOCKS5 server locally, and forwards traffic through the tunnel.
-Client B (tunnel_exit.py) must connect to the same cPanel host afterwards.
+Tunnel Server (Client A) — TCP forwarder side.
+Connects to cPanel, establishes the FIFO bridge, then accepts local TCP
+connections on listen_host:listen_port and pipes each one through the
+WebSocket tunnel. The exit node (tunnel_exit.py) forwards to its configured
+upstream host.
 """
 
 import asyncio
 import base64
-import os
-import socket
 import ssl
-import struct
 import sys
 import traceback
 
@@ -26,7 +24,6 @@ from websockets.exceptions import (
 from cpanel_auth import CONFIG_FILE, load_config, cpanel_login, build_ws_url
 from proxy_util import create_proxy_connection
 
-SOCKS5_PORT = 10808
 MAX_CHUNK = 2048
 DEBUG = False
 
@@ -35,10 +32,6 @@ def dbg(msg):
     if DEBUG:
         print("[dbg] %s" % msg)
 
-
-# ---------------------------------------------------------------------------
-# Protocol helpers
-# ---------------------------------------------------------------------------
 
 def encode_frame(ftype, conn_id, payload=b""):
     return "%s:%d:%s\n" % (ftype, conn_id, base64.b64encode(payload).decode("ascii"))
@@ -58,13 +51,10 @@ def decode_frame(line):
 
 
 # ---------------------------------------------------------------------------
-# Deployer — uploads relay + bridge, starts relay, execs bridge
+# Deployer — sets up the FIFO bridge on cPanel
 # ---------------------------------------------------------------------------
 
 async def deploy_remote(ws):
-    """Deploy relay.py and client.py (bridge) to cPanel, start them,
-    and wait for TUNNEL_READY."""
-
     async def send_cmd(cmd):
         await ws.send(cmd + "\n")
 
@@ -82,7 +72,6 @@ async def deploy_remote(ws):
             print("[debug] %s" % collected.strip()[:200])
         return collected
 
-    # Suppress echo, newline translation, prompt, and history
     await send_cmd("HISTFILE=/dev/null; history -c")
     await asyncio.sleep(0.2)
     await send_cmd("stty -echo")
@@ -93,26 +82,17 @@ async def deploy_remote(ws):
     await asyncio.sleep(0.2)
     await drain(0.5)
 
-    # Set up hidden working dir and FIFOs with innocuous names.
-    # mkfifo is idempotent here (silently no-op if peer already created them)
-    # so either side can come up first without orphaning the other's open fds.
     await send_cmd("mkdir -p $HOME/.cache/.fontconfig")
     await asyncio.sleep(0.2)
     await send_cmd("mkfifo $HOME/.cache/.fontconfig/.uuid-r 2>/dev/null; mkfifo $HOME/.cache/.fontconfig/.uuid-w 2>/dev/null; true")
     await asyncio.sleep(0.3)
     await drain(0.3, silent=False)
 
-    # Open pipes with disguised process names
     await send_cmd("exec -a 'bash' cat $HOME/.cache/.fontconfig/.uuid-r & exec -a 'bash' cat > $HOME/.cache/.fontconfig/.uuid-w")
     print("[*] Waiting for exit node (Client B) to connect ...")
 
-    # The exec blocks until Client B opens the other end of the FIFO.
-    # We repeatedly send TUNNEL_READY until Client B echoes it back,
-    # confirming the round-trip pipe is working.
     buf = ""
     while True:
-        # Send a probe — if pipes aren't connected yet it gets buffered
-        # or dropped, which is fine. Once connected, Client B will see it.
         try:
             await ws.send("TUNNEL_READY\n")
         except (ConnectionClosedError, ConnectionClosedOK):
@@ -127,7 +107,6 @@ async def deploy_remote(ws):
                 print("[+] Tunnel established.")
                 return
         except asyncio.TimeoutError:
-            # No response yet — Client B hasn't connected. Retry.
             continue
 
 
@@ -192,135 +171,11 @@ class WsMux:
                 if DEBUG:
                     traceback.print_exc()
         finally:
-            # Always unblock SOCKS waiters (avoids hangs if the WS dies oddly).
             for q in list(self._queues.values()):
                 try:
                     await q.put((None, b""))
                 except Exception:
                     pass
-
-
-# ---------------------------------------------------------------------------
-# SOCKS5 server
-# ---------------------------------------------------------------------------
-
-SOCKS5_CMD_CONNECT = 0x01
-SOCKS5_CMD_BIND = 0x02
-SOCKS5_CMD_UDP = 0x03
-
-
-async def socks5_read_addr(reader):
-    """Read SOCKS5 address (atyp + addr + port). Returns (host, port, raw_addr_bytes)."""
-    data = await reader.readexactly(1)
-    atyp = data[0]
-    if atyp == 0x01:
-        raw = await reader.readexactly(4)
-        host = "%d.%d.%d.%d" % struct.unpack("!BBBB", raw)
-        addr_bytes = bytes([atyp]) + raw
-    elif atyp == 0x03:
-        dlen_b = await reader.readexactly(1)
-        dlen = dlen_b[0]
-        name = await reader.readexactly(dlen)
-        host = name.decode("ascii")
-        addr_bytes = bytes([atyp]) + dlen_b + name
-    elif atyp == 0x04:
-        raw = await reader.readexactly(16)
-        import ipaddress
-        host = str(ipaddress.IPv6Address(raw))
-        addr_bytes = bytes([atyp]) + raw
-    else:
-        raise ValueError("Unsupported address type %d" % atyp)
-    port_b = await reader.readexactly(2)
-    port = struct.unpack("!H", port_b)[0]
-    return host, port, addr_bytes + port_b
-
-
-async def socks5_handshake(reader, writer):
-    """Returns (cmd, host, port)."""
-    data = await reader.readexactly(2)
-    ver, nmethods = struct.unpack("!BB", data)
-    dbg("greeting: ver=%d nmethods=%d" % (ver, nmethods))
-    if ver != 0x05:
-        raise ValueError("Not SOCKS5 (ver=%d)" % ver)
-    methods = await reader.readexactly(nmethods)
-    dbg("methods: %s" % [m for m in methods])
-    writer.write(struct.pack("!BB", 0x05, 0x00))
-    await writer.drain()
-
-    data = await reader.readexactly(3)
-    ver, cmd, _ = struct.unpack("!BBB", data)
-    cmd_names = {1: "CONNECT", 2: "BIND", 3: "UDP_ASSOCIATE"}
-    dbg("request: ver=%d cmd=%d(%s)" % (ver, cmd, cmd_names.get(cmd, "?")))
-    if ver != 0x05:
-        raise ValueError("Not SOCKS5 (ver=%d)" % ver)
-    if cmd not in (SOCKS5_CMD_CONNECT, SOCKS5_CMD_BIND, SOCKS5_CMD_UDP):
-        writer.write(struct.pack("!BBBBIH", 0x05, 0x07, 0x00, 0x01, 0, 0))
-        await writer.drain()
-        raise ValueError("Unsupported command %d" % cmd)
-
-    host, port, _ = await socks5_read_addr(reader)
-    dbg("target: %s:%d" % (host, port))
-    return cmd, host, port
-
-
-def socks5_reply(rep_code, writer, bind_addr="0.0.0.0", bind_port=0):
-    """Send SOCKS5 reply. rep_code: 0x00=success, 0x01=general failure, 0x05=refused, etc."""
-    parts = bind_addr.split(".")
-    if len(parts) == 4:
-        addr_bytes = struct.pack("!BBBB", *[int(p) for p in parts])
-        writer.write(struct.pack("!BBB", 0x05, rep_code, 0x00) +
-                      b'\x01' + addr_bytes + struct.pack("!H", bind_port))
-    else:
-        writer.write(struct.pack("!BBBBIH", 0x05, rep_code, 0x00, 0x01, 0, bind_port))
-
-
-def parse_udp_header(data):
-    """Parse SOCKS5 UDP header. Returns (frag, atyp, host, port, payload, header_len)."""
-    if len(data) < 4:
-        return None
-    frag = data[2]
-    atyp = data[3]
-    offset = 4
-    if atyp == 0x01:
-        if len(data) < offset + 6:
-            return None
-        host = "%d.%d.%d.%d" % struct.unpack("!BBBB", data[offset:offset + 4])
-        offset += 4
-    elif atyp == 0x03:
-        if len(data) < offset + 1:
-            return None
-        dlen = data[offset]
-        offset += 1
-        if len(data) < offset + dlen + 2:
-            return None
-        host = data[offset:offset + dlen].decode("ascii")
-        offset += dlen
-    elif atyp == 0x04:
-        if len(data) < offset + 18:
-            return None
-        import ipaddress
-        host = str(ipaddress.IPv6Address(data[offset:offset + 16]))
-        offset += 16
-    else:
-        return None
-    port = struct.unpack("!H", data[offset:offset + 2])[0]
-    offset += 2
-    return frag, atyp, host, port, data[offset:], offset
-
-
-def build_udp_header(host, port):
-    """Build SOCKS5 UDP response header (RSV + FRAG + ATYP + ADDR + PORT)."""
-    # Try IPv4 first
-    parts = host.split(".")
-    if len(parts) == 4:
-        try:
-            addr = struct.pack("!BBBB", *[int(p) for p in parts])
-            return struct.pack("!HBB", 0, 0, 0x01) + addr + struct.pack("!H", port)
-        except (ValueError, struct.error):
-            pass
-    # Domain name
-    encoded = host.encode("ascii")
-    return struct.pack("!HBB", 0, 0, 0x03) + bytes([len(encoded)]) + encoded + struct.pack("!H", port)
 
 
 # ---------------------------------------------------------------------------
@@ -341,8 +196,6 @@ async def get_conn_id():
 
 
 async def _relay_data(reader, writer, mux, q, conn_id):
-    """Bidirectional relay between a local TCP socket and the tunnel mux."""
-
     async def local_to_remote():
         try:
             while True:
@@ -396,185 +249,33 @@ async def _relay_data(reader, writer, mux, q, conn_id):
         raise
 
 
-async def handle_connect(reader, writer, mux, conn_id, host, port):
-    """Handle SOCKS5 CONNECT command."""
-    q = mux.register(conn_id)
-    target = "%s:%d" % (host, port)
-    dbg("connect conn_id=%d → %s" % (conn_id, target))
-    await mux.send_frame("N", conn_id, target.encode("utf-8"))
-
-    dbg("connect conn_id=%d waiting for ack" % conn_id)
-    ftype, payload = await asyncio.wait_for(q.get(), timeout=15.0)
-    dbg("connect conn_id=%d ack: type=%s payload=%s" % (conn_id, ftype, payload[:80]))
-    if ftype != "A" or not payload.startswith(b"OK"):
-        dbg("connect conn_id=%d FAILED: %s" % (conn_id, payload))
-        socks5_reply(0x05, writer)
-        await writer.drain()
-        return
-
-    dbg("connect conn_id=%d established" % conn_id)
-    socks5_reply(0x00, writer)
-    await writer.drain()
-
-    await _relay_data(reader, writer, mux, q, conn_id)
-
-
-async def handle_bind(reader, writer, mux, conn_id, host, port):
-    """Handle SOCKS5 BIND command."""
-    q = mux.register(conn_id)
-    target = "%s:%d" % (host, port)
-    await mux.send_frame("B", conn_id, target.encode("utf-8"))
-
-    # First reply: bound address from exit node
-    ftype, payload = await asyncio.wait_for(q.get(), timeout=15.0)
-    if ftype != "A" or not payload.startswith(b"OK:"):
-        socks5_reply(0x05, writer)
-        await writer.drain()
-        return
-
-    # payload = OK:bind_host:bind_port
-    parts = payload.decode("utf-8").split(":", 2)
-    bind_host = parts[1] if len(parts) > 1 else "0.0.0.0"
-    bind_port = int(parts[2]) if len(parts) > 2 else 0
-    socks5_reply(0x00, writer, bind_host, bind_port)
-    await writer.drain()
-
-    # Second reply: incoming connection
-    ftype, payload = await asyncio.wait_for(q.get(), timeout=120.0)
-    if ftype != "I":
-        socks5_reply(0x05, writer)
-        await writer.drain()
-        return
-
-    # payload = remote_host:remote_port
-    rparts = payload.decode("utf-8").rsplit(":", 1)
-    rhost = rparts[0] if len(rparts) > 0 else "0.0.0.0"
-    rport = int(rparts[1]) if len(rparts) > 1 else 0
-    socks5_reply(0x00, writer, rhost, rport)
-    await writer.drain()
-
-    await _relay_data(reader, writer, mux, q, conn_id)
-
-
-async def handle_udp_associate(reader, writer, mux, conn_id):
-    """Handle SOCKS5 UDP ASSOCIATE command."""
-    q = mux.register(conn_id)
-    loop = asyncio.get_event_loop()
-
-    # Create local UDP relay socket
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.bind(("127.0.0.1", 0))
-    udp_sock.setblocking(False)
-    relay_addr, relay_port = udp_sock.getsockname()
-
-    # Tell the SOCKS5 client where to send UDP
-    socks5_reply(0x00, writer, relay_addr, relay_port)
-    await writer.drain()
-
-    client_addr = None  # Will be set on first UDP packet from client
-
-    async def udp_to_tunnel():
-        """Read UDP from local client, parse SOCKS5 header, send U frame to tunnel."""
-        nonlocal client_addr
-        while True:
-            try:
-                data, addr = await loop.run_in_executor(None, lambda: udp_sock.recvfrom(65535))
-            except OSError:
-                break
-            if not data:
-                break
-            client_addr = addr
-            parsed = parse_udp_header(data)
-            if parsed is None:
-                continue
-            frag, atyp, dhost, dport, payload, _ = parsed
-            if frag != 0:
-                continue  # fragmentation not supported
-            # Encode: target_host:target_port + \x00 + udp_payload
-            target_info = ("%s:%d" % (dhost, dport)).encode("utf-8") + b"\x00" + payload
-            await mux.send_frame("U", conn_id, target_info)
-
-    async def tunnel_to_udp():
-        """Read U frames from tunnel, wrap with SOCKS5 header, send UDP to client."""
-        while True:
-            ftype, payload = await q.get()
-            if ftype == "U":
-                # payload = source_host:source_port\x00udp_data
-                sep = payload.find(b"\x00")
-                if sep < 0:
-                    continue
-                src_info = payload[:sep].decode("utf-8", errors="replace")
-                udp_data = payload[sep + 1:]
-                src_parts = src_info.rsplit(":", 1)
-                if len(src_parts) != 2:
-                    continue
-                src_host = src_parts[0]
-                src_port = int(src_parts[1])
-                header = build_udp_header(src_host, src_port)
-                if client_addr:
-                    try:
-                        udp_sock.sendto(header + udp_data, client_addr)
-                    except OSError:
-                        pass
-            elif ftype == "C" or ftype is None:
-                break
-
-    async def watch_tcp():
-        """The TCP connection stays open during the association.
-        If the client closes it, the UDP association ends."""
-        try:
-            while True:
-                data = await reader.read(1)
-                if not data:
-                    break
-        except (ConnectionError, OSError):
-            pass
-
-    try:
-        done, pending = await asyncio.wait(
-            [asyncio.ensure_future(t) for t in [udp_to_tunnel(), tunnel_to_udp(), watch_tcp()]],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for t in pending:
-            t.cancel()
-    finally:
-        try:
-            await mux.send_frame("C", conn_id)
-        except ConnectionClosed:
-            pass
-        udp_sock.close()
-
-
-async def handle_socks_client(reader, writer, mux):
+async def handle_client(reader, writer, mux):
     conn_id = None
     peer = writer.get_extra_info("peername")
     dbg("new connection from %s" % (peer,))
     try:
-        cmd, host, port = await socks5_handshake(reader, writer)
         conn_id = await get_conn_id()
-        dbg("conn_id=%d cmd=%d target=%s:%d" % (conn_id, cmd, host, port))
+        q = mux.register(conn_id)
 
-        if cmd == SOCKS5_CMD_CONNECT:
-            await handle_connect(reader, writer, mux, conn_id, host, port)
-        elif cmd == SOCKS5_CMD_BIND:
-            await handle_bind(reader, writer, mux, conn_id, host, port)
-        elif cmd == SOCKS5_CMD_UDP:
-            await handle_udp_associate(reader, writer, mux, conn_id)
+        # Empty target — exit node uses its configured upstream.
+        await mux.send_frame("N", conn_id, b"")
+
+        ftype, payload = await asyncio.wait_for(q.get(), timeout=15.0)
+        if ftype != "A" or not payload.startswith(b"OK"):
+            dbg("conn_id=%s ack failed: %s" % (conn_id, payload[:80]))
+            return
+
+        await _relay_data(reader, writer, mux, q, conn_id)
 
     except asyncio.CancelledError:
         dbg("conn_id=%s cancelled" % conn_id)
-    except (asyncio.TimeoutError, ValueError, asyncio.IncompleteReadError,
-            ConnectionError, OSError) as e:
-        dbg("SOCKS5 error (conn_id=%s): %s" % (conn_id, e))
-        if DEBUG:
-            traceback.print_exc()
+    except (asyncio.TimeoutError, ConnectionError,
+            asyncio.IncompleteReadError, OSError) as e:
+        dbg("forward error (conn_id=%s): %s" % (conn_id, e))
     except ConnectionClosed as e:
-        print(
-            "[-] SOCKS5: tunnel WebSocket closed (conn_id=%s): %s"
-            % (conn_id, e)
-        )
+        print("[-] tunnel WebSocket closed (conn_id=%s): %s" % (conn_id, e))
     except Exception as e:
-        print("[-] SOCKS5 unexpected error (conn_id=%s): %s" % (conn_id, e))
+        print("[-] unexpected error (conn_id=%s): %s" % (conn_id, e))
         if DEBUG:
             traceback.print_exc()
     finally:
@@ -605,13 +306,7 @@ async def keepalive(mux):
 # ---------------------------------------------------------------------------
 
 async def run_tunnel_once(cfg, ssl_ctx, on_established=None):
-    """Single tunnel session. Raises on disconnect.
-
-    If *on_established* is set, it is called (sync) once the SOCKS proxy is up so
-    the parent can reset reconnect backoff after a healthy bring-up.
-    """
     verify_ssl = cfg["verify_ssl"]
-
     proxy = cfg.get("proxy")
 
     print("[*] Logging in to cPanel ...")
@@ -624,10 +319,6 @@ async def run_tunnel_once(cfg, ssl_ctx, on_established=None):
     origin = "https://%s:%d" % (cfg["host"], cfg["port"])
 
     print("[*] Connecting WebSocket ...")
-    print("[*] WS URL: %s" % ws_url)
-    print("[*] Origin: %s" % origin)
-    print("[*] Cookie: %s" % cookie)
-    print("[*] Proxy: %s" % proxy)
     ws_kwargs = dict(
         ssl=ssl_ctx,
         additional_headers={"Origin": origin, "Cookie": cookie},
@@ -641,14 +332,9 @@ async def run_tunnel_once(cfg, ssl_ctx, on_established=None):
         print("[*] Using pre-connected proxy socket: %s" % sock)
 
     try:
-        ws_conn = websockets.connect(ws_url, **ws_kwargs)
-        ws = await ws_conn
+        ws = await websockets.connect(ws_url, **ws_kwargs)
     except Exception as e:
         print("[!] WebSocket connect failed: %s" % e)
-        if hasattr(e, 'status_code'):
-            print("[!] HTTP status: %s" % e.status_code)
-        if hasattr(e, 'headers'):
-            print("[!] Response headers: %s" % e.headers)
         raise
 
     async with ws:
@@ -660,11 +346,14 @@ async def run_tunnel_once(cfg, ssl_ctx, on_established=None):
 
         ka_task = asyncio.ensure_future(keepalive(mux))
 
+        listen_host = cfg["listen_host"]
+        listen_port = cfg["listen_port"]
         server = await asyncio.start_server(
-            lambda r, w: handle_socks_client(r, w, mux),
-            "127.0.0.1", SOCKS5_PORT,
+            lambda r, w: handle_client(r, w, mux),
+            listen_host, listen_port,
         )
-        print("[+] SOCKS5 proxy listening on 127.0.0.1:%d" % SOCKS5_PORT)
+        print("[+] Forwarding %s:%d -> tunnel -> (exit upstream)"
+              % (listen_host, listen_port))
         if on_established is not None:
             on_established()
 
@@ -680,10 +369,7 @@ async def run_tunnel_once(cfg, ssl_ctx, on_established=None):
             if finished is reader_task:
                 if not reader_task.cancelled():
                     tunnel_ws_dead = True
-                    print(
-                        "[!] Tunnel WebSocket reader ended (remote closed or error); "
-                        "will reconnect."
-                    )
+                    print("[!] Tunnel WebSocket reader ended; will reconnect.")
                 serve_task.cancel()
             else:
                 reader_task.cancel()
@@ -724,7 +410,7 @@ async def run_tunnel(cfg):
     while True:
         try:
             await run_tunnel_once(cfg, ssl_ctx, on_established=session_established)
-            break  # clean exit
+            break
         except KeyboardInterrupt:
             raise
         except (ConnectionClosedError, ConnectionClosedOK, websockets.exceptions.InvalidStatusCode,

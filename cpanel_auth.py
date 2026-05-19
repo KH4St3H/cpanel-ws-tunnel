@@ -28,6 +28,10 @@ def load_config(path=None):
         "password":   str(s.get("password", "")).strip(),
         "verify_ssl": bool(s.get("verify_ssl", True)),
         "proxy":      str(s.get("proxy", "")).strip() or None,
+        "listen_host": str(s.get("listen_host", "127.0.0.1")).strip(),
+        "listen_port": int(s.get("listen_port", 10808)),
+        "upstream_host": str(s.get("upstream_host", "")).strip(),
+        "upstream_port": int(s.get("upstream_port", 0)),
     }
 
 

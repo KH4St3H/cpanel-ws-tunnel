@@ -5,3 +5,11 @@ cpanel:
   password: "your_password"
   verify_ssl: false
   proxy: "socks5://127.0.0.1:20001"
+
+  # tunnel_server.py: local TCP listener
+  listen_host: "127.0.0.1"
+  listen_port: 10808
+
+  # tunnel_exit.py: upstream host to forward incoming tunnel connections to
+  upstream_host: "example.com"
+  upstream_port: 80
