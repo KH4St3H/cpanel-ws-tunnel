@@ -6,6 +6,7 @@ then for every N frame opens a TCP connection to the configured upstream
 host and relays bytes.
 """
 
+import argparse
 import asyncio
 import base64
 import ssl
@@ -302,9 +303,16 @@ async def run_exit(cfg):
 
 def main():
     global DEBUG
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    config_path = args[0] if args else CONFIG_FILE
-    DEBUG = "--debug" in sys.argv or "-d" in sys.argv
+    parser = argparse.ArgumentParser(description="cPanel WS tunnel exit (TCP forwarder)")
+    parser.add_argument("-c", "--config", default=CONFIG_FILE,
+                        help="Path to config YAML (default: %(default)s)")
+    parser.add_argument("config_pos", nargs="?",
+                        help="Path to config YAML (positional, overrides -c)")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+
+    config_path = args.config_pos or args.config
+    DEBUG = args.debug
 
     try:
         cfg = load_config(config_path)
